@@ -1,0 +1,4 @@
+{
+  "extends": ["next/core-web-vitals"],
+  "rules": { "react/no-unescaped-entities": 0 } // FIXME fare escape (3) entities  in pages/index.js
+}

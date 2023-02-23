@@ -1,0 +1,154 @@
+default:
+  image: node:latest
+
+stages:
+  - test
+  - build
+  - release
+  - deploy
+
+unit-test:
+  stage: test
+  before_script:
+    - cat "$ENV_TEST" > "app/.env.test"
+    - 'yarn global add jest'
+  script:
+    - cd "$CI_PROJECT_DIR/app"
+    - npm ci --cache .npm --prefer-offline --progress=false --no-audit
+    - 'npm install --save-dev jest-junit'
+    - 'npx eslint . -f json -o eslint_report.json'
+    - 'jest --ci --config $CI_PROJECT_DIR/app/jest.config.js --reporters=default --reporters=jest-junit --coverage'
+  artifacts:
+    when: always
+    paths:
+      - app/coverage/lcov.info
+      - app/test-report.xml
+      - app/eslint_report.json
+    reports:
+      junit:
+        - app/junit.xml
+  only:
+    - merge_requests
+    - main
+
+sonarqube-check:
+  stage: test
+  needs: ["unit-test"]
+  image: 
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+    VERSION_CUSTOM: "v0.$CI_PIPELINE_IID"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+    - sonar-scanner -Dsonar.javascript.lcov.reportPaths=app/coverage/lcov.info -Dsonar.testExecutionReportPaths=app/test-report.xml -Dsonar.eslint.reportPaths=app/eslint_report.json -Dsonar.projectVersion=$VERSION_CUSTOM
+  allow_failure: true
+  only:
+    - main
+
+build-next:
+  only:
+    - main
+    - merge_requests
+  stage: build
+  before_script:
+    - cat "$ENV_PROD" > "app/.env.production"
+  script:
+    - cd "$CI_PROJECT_DIR/app/"
+    - npm ci --cache .npm --prefer-offline --progress=false --no-audit
+    - npm run build
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - app/node_modules/
+      - app/.next/cache/
+  artifacts:
+    when: always
+    paths:
+        - app/.next
+
+build-image:
+  only:
+    - merge_requests
+  image: docker:20.10.22
+  stage: build
+  needs: ["build-next"]
+  services:
+    - docker:20.10.22-dind
+  variables:
+    IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build --no-cache -t $IMAGE_TAG .
+    - docker push $IMAGE_TAG
+
+deploy_prod:
+  before_script:
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -p 22223 prod-team11.snakes.wtf >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  only:
+    - main
+  stage: deploy
+  script:
+    - echo "Deploy to prod server"
+    - ssh -p 22223 team11@prod-team11.snakes.wtf "/home/team11/production/deployProduction.sh"
+  environment:
+    name: production
+    url: https://prod-team11.snakes.wtf
+
+deploy_stag:
+  before_script:
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -p 22223 staging-team11.snakes.wtf  >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  only:
+    - merge_requests
+  stage: deploy
+  script:
+    - echo "Deploy to staging server" 
+    - ssh -p 22223 team11@staging-team11.snakes.wtf "/home/team11/staging/deployStaging.sh $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  environment:
+    name: staging
+    url: https://staging-team11.snakes.wtf
+
+release_job:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never                                  # Do not run this job when a tag is created manually
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH  # Run this job when commits are pushed or merged to the default branch
+  script:
+    - echo "running release_job for $TAG"
+  release:                                         # See https://docs.gitlab.com/ee/ci/yaml/#release for available properties
+    tag_name: 'v0.$CI_PIPELINE_IID'                # The version is incremented per pipeline.
+    description: 'v0.$CI_PIPELINE_IID'
+    ref: '$CI_COMMIT_SHA'                          # The tag is created from the pipeline SHA.
+
+release-image:
+  stage: release
+  image: docker:20.10.22
+  services:
+    - docker:20.10.22-dind
+  variables:
+    CONTAINER_RELEASE_IMAGE: $CI_REGISTRY_IMAGE:latest
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build --no-cache -t $CONTAINER_RELEASE_IMAGE .
+    - docker push $CONTAINER_RELEASE_IMAGE
+  only:
+    - main
